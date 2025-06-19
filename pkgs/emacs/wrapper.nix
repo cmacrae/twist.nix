@@ -1,20 +1,23 @@
-{
-  lib,
-  runCommandLocal,
-  makeWrapper,
-  writeText,
-  buildEnv,
-  emacs,
-  lndir,
-  texinfo,
-  packageNames,
-  elispPackages,
-  executablePackages,
-  extraOutputsToInstall,
-  exportManifest,
-  configurationRevision,
-  extraSiteStartElisp,
-}: let
+{ lib
+, stdenv
+, runCommandLocal
+, makeWrapper
+, writeText
+, writeShellScript
+, buildEnv
+, emacs
+, lndir
+, texinfo
+, packageNames
+, elispPackages
+, executablePackages
+, extraOutputsToInstall
+, exportManifest
+, configurationRevision
+, extraSiteStartElisp
+,
+}:
+let
   inherit (builtins) length;
 
   elispInputs = lib.attrVals packageNames elispPackages;
@@ -54,7 +57,7 @@
 
   lispList = strings:
     wrap "'(" ")"
-    (lib.concatMapStringsSep " " (wrap "\"" "\"") strings);
+      (lib.concatMapStringsSep " " (wrap "\"" "\"") strings);
 
   nativeLoadPath = "${packageEnv}/share/emacs/native-lisp/";
 
@@ -69,48 +72,78 @@
     );
     executablePackages = map (pkg: "${pkg}/bin") executablePackages;
   });
-in
-  runCommandLocal "emacs"
-  {
-    buildInputs = [lndir texinfo];
-    propagatedBuildInputs = [emacs packageEnv] ++ executablePackages;
-    nativeBuildInputs = [makeWrapper];
-    # Support for nix run
-    meta.mainProgram = "emacs";
 
-    passAsFile = ["subdirs" "siteStartExtra"];
+  macosAppLauncher = writeShellScript "emacs-launcher" ''
+    SCRIPT_DIR="$( cd "$( dirname "''${BASH_SOURCE[0]}" )" && pwd )"
+    APP_CONTENTS="$(dirname "$SCRIPT_DIR")"
+    APP_RESOURCES="$APP_CONTENTS/Resources"
 
-    nativeLoadPath = "${nativeLoadPath}:${emacs}/share/emacs/native-lisp/:";
+    # Use a login shell to source the Nix environment
+    # This ensures we get the same environment
+    exec -l "$SHELL" -c '
+      if [ -d "'$APP_RESOURCES'/site-lisp" ]; then
+        export EMACSLOADPATH="'$APP_RESOURCES'/site-lisp:"
+      fi
 
-    subdirs = ''
-      (setq load-path (append ${
-        lispList (map (pkg: "${pkg}/share/emacs/site-lisp/") elispInputs)
-      } load-path))
-    '';
+      if [ -d "'$APP_RESOURCES'/info" ]; then
+        export INFOPATH="'$APP_RESOURCES'/info:${emacs}/share/info''${INFOPATH:+:$INFOPATH}"
+      fi
 
-    siteStartExtra = ''
-      (when init-file-user
-        ${lib.optionalString exportManifest ''
-        (defconst twist-running-emacs "${emacs.outPath}")
-        (defconst twist-current-manifest-file "${elispManifest}")
+      ${lib.optionalString nativeComp ''
+      if [ -d "'$APP_RESOURCES'/native-lisp" ]; then
+        export EMACSNATIVELOADPATH="'$APP_RESOURCES'/native-lisp:${packageEnv}/share/emacs/native-lisp:"
+      fi
       ''}
-        ${lib.optionalString (configurationRevision != null) ''
-          (defvar twist-configuration-revision "${configurationRevision}")
-        ''}
-        ${
-        lib.concatMapStrings (pkg: ''
-          (load "${pkg}/share/emacs/site-lisp/${pkg.ename}-autoloads.el" t t)
-        '')
-        elispInputs
-        })
-      ${extraSiteStartElisp}
-    '';
 
-    elispManifestPath =
-      if exportManifest
-      then elispManifest.outPath
-      else null;
-  }
+      if [ -d "'$APP_RESOURCES'/bin" ]; then
+        export PATH="'$APP_RESOURCES'/bin:$PATH"
+      fi
+
+      exec "'$SCRIPT_DIR'/_Emacs" "$@"
+    ' emacs-launcher "$@"
+  '';
+in
+runCommandLocal "emacs"
+{
+  buildInputs = [ lndir texinfo ];
+  propagatedBuildInputs = [ emacs packageEnv ] ++ executablePackages;
+  nativeBuildInputs = [ makeWrapper ];
+  # Support for nix run
+  meta.mainProgram = "emacs";
+
+  passAsFile = [ "subdirs" "siteStartExtra" ];
+
+  nativeLoadPath = "${nativeLoadPath}:${emacs}/share/emacs/native-lisp/:";
+
+  subdirs = ''
+    (setq load-path (append ${
+      lispList (map (pkg: "${pkg}/share/emacs/site-lisp/") elispInputs)
+    } load-path))
+  '';
+
+  siteStartExtra = ''
+    (when init-file-user
+      ${lib.optionalString exportManifest ''
+      (defconst twist-running-emacs "${emacs.outPath}")
+      (defconst twist-current-manifest-file "${elispManifest}")
+    ''}
+      ${lib.optionalString (configurationRevision != null) ''
+        (defvar twist-configuration-revision "${configurationRevision}")
+      ''}
+      ${
+      lib.concatMapStrings (pkg: ''
+        (load "${pkg}/share/emacs/site-lisp/${pkg.ename}-autoloads.el" t t)
+      '')
+      elispInputs
+      })
+    ${extraSiteStartElisp}
+  '';
+
+  elispManifestPath =
+    if exportManifest
+    then elispManifest.outPath
+    else null;
+}
   ''
     mkdir -p $out/bin
     lndir -silent ${emacs}/bin $out/bin
@@ -176,7 +209,7 @@ in
 
     for bin in $out/bin/*
     do
-      if [[ $(basename $bin) = emacs-* ]]
+      if [[ $(basename $bin) = emacs || $(basename $bin) = emacs-* ]]
       then
       wrapProgram $bin \
         ${lib.optionalString (length executablePackages > 0) "--prefix PATH : ${lib.escapeShellArg (lib.makeBinPath executablePackages)}"} \
@@ -187,4 +220,35 @@ in
         --set EMACSLOADPATH "$siteLisp:"
       fi
     done
+
+    ${lib.optionalString stdenv.hostPlatform.isDarwin ''
+      if [ -d "${emacs}/Applications" ]; then
+        mkdir -p $out/Applications
+        cp -R ${emacs}/Applications/Emacs.app $out/Applications/
+        chmod -R u+w $out/Applications/Emacs.app || true
+
+        mv $out/Applications/Emacs.app/Contents/MacOS/Emacs $out/Applications/Emacs.app/Contents/MacOS/_Emacs
+
+        mkdir -p $out/Applications/Emacs.app/Contents/Resources
+        ln -s $siteLisp $out/Applications/Emacs.app/Contents/Resources/site-lisp
+        ln -s $out/share/info $out/Applications/Emacs.app/Contents/Resources/info
+        ${lib.optionalString nativeComp ''
+          ln -s $nativeLisp $out/Applications/Emacs.app/Contents/Resources/native-lisp
+        ''}
+        ${lib.optionalString (length executablePackages > 0) ''
+          mkdir -p $out/Applications/Emacs.app/Contents/Resources/bin
+          for pkg in ${lib.escapeShellArg (lib.concatStringsSep " " executablePackages)}; do
+            if [ -d "$pkg/bin" ]; then
+              for exe in $pkg/bin/*; do
+                if [ -x "$exe" ]; then
+                  ln -s "$exe" $out/Applications/Emacs.app/Contents/Resources/bin/
+                fi
+              done
+            fi
+          done
+        ''}
+
+        install -m 755 ${macosAppLauncher} $out/Applications/Emacs.app/Contents/MacOS/Emacs
+      fi
+    ''}
   ''
